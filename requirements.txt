@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+uvloop
+sqlalchemy
+pydantic
+requests
+redis
+pytest
+httpx

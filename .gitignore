@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+# Env (DO NOT COMMIT)
+.env
+.env.*
+# Virtual env
+venv/
+# Logs
+logs/
+*.log
+# Temp
+tmp/
+*.tar.gz
+# DB
+*.db
+*.sqlite3
+# Node
+node_modules/
+# Test outputs
+tests/*.json
+tests/*.txt
+# Garbage
+*.stderr
