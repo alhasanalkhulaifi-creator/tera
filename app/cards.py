@@ -127,7 +127,6 @@ def buy_card(payload: CardBuyIn):
     if not use_redis_rate_limiter and _use_in_memory_rate_limiter(rate_key):
         return _rate_limit_exceeded()
 
-    card_id = None
     _q_s = [0.0]
     total_ms = 0.0
     txn_ms = 0.0
@@ -136,51 +135,53 @@ def buy_card(payload: CardBuyIn):
         txn_t0 = time.perf_counter()
         with engine.begin() as _raw:
             conn = _TimedConn(_raw, _q_s)
-            sel = text(
-                "SELECT id, code, price FROM cards "
-                "WHERE status = 'available' AND category = :category "
-                "ORDER BY id LIMIT 5"
-            )
-            rows = conn.execute(sel, {'category': payload.category}).fetchall()
-            if not rows:
-                return JSONResponse(status_code=400, content={"error": "no_cards_available_for_category"})
-            card_res = None
-            card_price = 0
-            for row in rows:
-                cid = row[0]
-                cprice = int(row[2] or 0)
-                claimed = conn.execute(
-                    text(
-                        "UPDATE cards SET status = 'sold', user_id = :uid, sold_at = now() "
-                        "WHERE id = :cid AND status = 'available' "
-                        "RETURNING id, code, category, price, status, user_id, created_at"
-                    ),
-                    {'uid': payload.user_id, 'cid': cid},
-                ).fetchone()
-                if claimed:
-                    card_id = cid
-                    card_price = cprice
-                    card_res = claimed
-                    break
-            if not card_res:
-                return JSONResponse(status_code=400, content={"error": "no_cards_available_for_category"})
 
-            uupd = conn.execute(
-                text(
-                    "UPDATE users "
-                    "SET balance = balance - :amount "
-                    "WHERE id = :id AND balance >= :amount "
-                    "RETURNING balance"
-                ),
-                {'amount': card_price, 'id': payload.user_id},
+            # 1. Lock user row
+            urow = conn.execute(
+                text("SELECT balance FROM users WHERE id = :id FOR UPDATE"),
+                {'id': payload.user_id},
             ).fetchone()
+            if not urow:
+                return JSONResponse(status_code=404, content={"error": "user_not_found"})
+            balance_before = int(urow[0] or 0)
 
-            if not uupd:
+            # 2. Lock one available card (no retry loop)
+            card_row = conn.execute(
+                text(
+                    "SELECT id, code, price FROM cards "
+                    "WHERE status = 'available' AND category = :category "
+                    "ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1"
+                ),
+                {'category': payload.category},
+            ).fetchone()
+            if not card_row:
+                return JSONResponse(status_code=400, content={"error": "no_cards_available_for_category"})
+
+            card_id = card_row[0]
+            card_price = int(card_row[2] or 0)
+
+            # 3. Validate balance (after both locks are held)
+            if balance_before < card_price:
                 return JSONResponse(status_code=400, content={"error": "insufficient_balance"})
 
-            balance_after = int(uupd[0] or 0)
-            balance_before = balance_after + card_price
+            # 4. Deduct balance
+            conn.execute(
+                text("UPDATE users SET balance = balance - :amount WHERE id = :id"),
+                {'amount': card_price, 'id': payload.user_id},
+            )
+            balance_after = balance_before - card_price
 
+            # 5. Mark card as sold
+            card_res = conn.execute(
+                text(
+                    "UPDATE cards SET status = 'sold', user_id = :uid, sold_at = now() "
+                    "WHERE id = :cid "
+                    "RETURNING id, code, category, price, status, user_id, created_at"
+                ),
+                {'uid': payload.user_id, 'cid': card_id},
+            ).fetchone()
+
+            # 6. Record transaction
             conn.execute(
                 text(
                     "INSERT INTO transactions (user_id, amount, type, balance_before, balance_after, "
